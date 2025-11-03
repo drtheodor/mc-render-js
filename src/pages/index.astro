@@ -449,7 +449,7 @@ scene.add(directionalLight3);
 // Load and render model
 const textureLoader = new THREE.TextureLoader();
 // Base URL should be the root of your assets
-const modelLoader = new MinecraftModelLoader(textureLoader, '');
+const modelLoader = new MinecraftModelLoader(textureLoader, import.meta.env.BASE_URL);
 
 async function loadAndAdd(modelPath: string, pos = [0, 0, 0], rot = [0, 0, 0]) {
     const blockModel = await modelLoader.loadModel(modelPath);
