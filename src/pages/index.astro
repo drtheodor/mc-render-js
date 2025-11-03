@@ -5,12 +5,514 @@
 <html lang="en">
 	<head>
 		<meta charset="utf-8" />
-		<link rel="icon" type="image/svg+xml" href="/favicon.svg" />
 		<meta name="viewport" content="width=device-width" />
-		<meta name="generator" content={Astro.generator} />
-		<title>Astro</title>
+		<title>Block Rendering Demo</title>
 	</head>
 	<body>
-		<h1>Astro</h1>
+		<h1>Demo MC Block Renderer</h1>
+        120fps, and doesn't suck ass
+        <div id="container"></div>
 	</body>
 </html>
+<script>
+import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls'
+import * as THREE from 'three';
+
+type McDirection = 'down' | 'up' | 'north' | 'south' | 'west' | 'east'
+
+type McModelFace = {
+    uv: UvArray,
+    texture: string,
+    tintindex?: number,
+    cullface?: string,
+};
+
+interface UvArray extends Array<number> {
+    length: 4
+}
+
+type McModelElement = {
+    from: number[],
+    to: number[],
+    faces: Record<McDirection, McModelFace>,
+};
+
+type McModel = {
+    parent: string,
+    textures: Record<string, string>,
+    elements: McModelElement[],
+    ambientocclusion?: boolean,
+    display: Record<string, Object>,
+};
+
+// script.js
+class MinecraftModelLoader {
+    textureLoader: THREE.TextureLoader;
+    baseUrl: string;
+    textures: Map<string, string | THREE.Texture>;
+    modelCache: Map<string, McModel>;
+
+    constructor(textureLoader: THREE.TextureLoader, baseUrl = '') {
+        this.textureLoader = textureLoader;
+        this.baseUrl = baseUrl.replace(/\/$/, '') + '/';
+        this.textures = new Map();
+        this.modelCache = new Map();
+    }
+
+    async loadModel(modelPath: string) {
+        // Parse namespace and path
+        let namespace = 'minecraft';
+        let path = modelPath;
+        
+        if (modelPath.includes(':')) {
+            [namespace, path] = modelPath.split(':');
+        }
+        
+        // Normalize path (ensure it starts with models/)
+        if (!path.startsWith('models/')) {
+            path = 'models/' + path;
+        }
+        
+        // Construct full path
+        const fullModelPath = `${this.baseUrl}assets/${namespace}/${path}.json`;
+        
+        if (this.modelCache.has(fullModelPath)) {
+            return this.modelCache.get(fullModelPath);
+        }
+        
+        const response = await fetch(fullModelPath);
+
+        if (!response.ok) {
+            throw new Error(`Failed to load model: ${fullModelPath} - ${response.status}`);
+        }
+        
+        const modelData = await response.json();
+        const resolvedModel = await this.resolveModelInheritance(modelData, namespace);
+        
+        this.modelCache.set(fullModelPath, resolvedModel);
+        return resolvedModel;
+    }
+
+    async resolveModelInheritance(model: McModel, namespace: string) {
+        if (model.parent) {
+            let parentNamespace = namespace;
+            let parentPath = model.parent;
+            
+            // Parse parent namespace if present
+            if (model.parent.includes(':')) {
+                [parentNamespace, parentPath] = model.parent.split(':');
+            }
+            
+            // Construct parent path if not namespaced
+            if (!parentPath.includes('/')) {
+                parentPath = `block/${parentPath}`;
+            }
+            
+            // Load parent model
+            const fullParentPath = `${parentNamespace}:${parentPath}`;
+            const parentModel = await this.loadModel(fullParentPath);
+
+            if (!parentModel) {
+                throw Error("No parent model: " + fullParentPath);
+            }
+            
+            // Inherit properties from parent
+            model.elements = model.elements || parentModel.elements;
+            model.textures = { ...parentModel.textures, ...model.textures };
+            model.ambientocclusion = model.ambientocclusion ?? parentModel.ambientocclusion;
+            model.display = { ...parentModel.display, ...model.display };
+        }
+        
+        // Resolve texture references (e.g., #texture -> actual texture path)
+        if (model.textures) {
+            // First pass: resolve all references
+            const resolvedTextures: Record<string, string> = {};
+            for (const [key, value] of Object.entries(model.textures)) {
+                if (typeof value === 'string' && value.startsWith('#')) {
+                    const refKey = value.substring(1);
+                    resolvedTextures[key] = model.textures[refKey] || value;
+                } else {
+                    resolvedTextures[key] = value;
+                }
+            }
+            
+            // Second pass: add namespace to non-namespaced textures
+            for (const [key, value] of Object.entries(resolvedTextures)) {
+                if (typeof value === 'string' && !value.includes(':') && !value.startsWith('#')) {
+                    resolvedTextures[key] = `${namespace}:${value}`;
+                }
+            }
+            
+            model.textures = resolvedTextures;
+        }
+        
+        // Process elements to resolve texture references
+        if (model.elements) {
+            for (const element of model.elements) {
+                if (element.faces) {
+                    for (const face of Object.values(element.faces)) {
+                        if (typeof face.texture === 'string') {
+                            if (face.texture.startsWith('#')) {
+                                const refKey = face.texture.substring(1);
+                                face.texture = model.textures[refKey] || face.texture;
+                            } else if (!face.texture.includes(':')) {
+                                face.texture = `${namespace}:${face.texture}`;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        return model;
+    }
+
+    async parseModel(modelData: McModel) {
+        const geometry = new THREE.BufferGeometry();
+        const vertices = [];
+        const uvs = [];
+        const indices = [];
+        const normals = [];
+        const materials = [];
+        const groups = []; // For multi-material support
+
+        // Load textures
+        const texturePromises = [];
+        if (modelData.textures) {
+            for (const [key, value] of Object.entries(modelData.textures)) {
+                if (typeof value === 'string' && !value.startsWith('#')) {
+                    texturePromises.push(this.loadTexture(value));
+                }
+            }
+        }
+        
+        // Also check for textures referenced in elements
+        if (modelData.elements) {
+            for (const element of modelData.elements) {
+                if (element.faces) {
+                    for (const face of Object.values(element.faces)) {
+                        if (typeof face.texture === 'string' && !face.texture.startsWith('#')) {
+                            texturePromises.push(this.loadTexture(face.texture));
+                        }
+                    }
+                }
+            }
+        }
+        
+        await Promise.all(texturePromises);
+
+        let materialIndex = 0;
+
+        // Process elements
+        for (const element of modelData.elements || []) {
+            const [minX, minY, minZ] = element.from.map(coord => (coord - 8) / 16);
+            const [maxX, maxY, maxZ] = element.to.map(coord => (coord - 8) / 16);
+
+            // Define cube faces with correct vertex ordering for texture orientation
+            // Using a consistent standard layout for all faces
+            const faces = [
+                { // East (positive X) - Right face
+                    vertices: [
+                        [maxX, minY, maxZ], // Bottom-right
+                        [maxX, maxY, maxZ],  // Top-right
+                        [maxX, minY, minZ], // Bottom-left
+                        [maxX, maxY, minZ], // Top-left
+                    ],
+                    uv: element.faces?.east?.uv,
+                    texture: element.faces?.east?.texture,
+                    normal: [1, 0, 0]
+                },
+                { // West (negative X) - Left face
+                    vertices: [
+                        [minX, minY, minZ], // Bottom-left
+                        [minX, maxY, minZ],  // Top-left
+                        [minX, minY, maxZ], // Bottom-right
+                        [minX, maxY, maxZ], // Top-right
+                    ],
+                    uv: element.faces?.west?.uv,
+                    texture: element.faces?.west?.texture,
+                    normal: [-1, 0, 0]
+                },
+                { // Up (positive Y) - Top face
+                    vertices: [
+                        [minX, maxY, minZ], // Top-left
+                        [maxX, maxY, minZ], // Top-right
+                        [minX, maxY, maxZ], // Bottom-left
+                        [maxX, maxY, maxZ]  // Bottom-right
+                    ],
+                    uv: element.faces?.up?.uv,
+                    texture: element.faces?.up?.texture,
+                    normal: [0, 1, 0]
+                },
+                { // Down (negative Y) - Bottom face
+                    vertices: [
+                        [minX, minY, maxZ], // Bottom-left
+                        [maxX, minY, maxZ], // Bottom-right
+                        [minX, minY, minZ], // Top-left
+                        [maxX, minY, minZ]  // Top-right
+                    ],
+                    uv: element.faces?.down?.uv,
+                    texture: element.faces?.down?.texture,
+                    normal: [0, -1, 0]
+                },
+                { // South (positive Z) - Front face
+                    vertices: [
+                        [minX, minY, maxZ], // Bottom-left
+                        [minX, maxY, maxZ], // Top-left
+                        [maxX, minY, maxZ], // Bottom-right
+                        [maxX, maxY, maxZ]  // Top-right
+                    ],
+                    uv: element.faces?.south?.uv,
+                    texture: element.faces?.south?.texture,
+                    normal: [0, 0, 1]
+                },
+                { // North (negative Z) - Back face
+                    vertices: [
+                        [maxX, minY, minZ], // Bottom-right
+                        [maxX, maxY, minZ], // Top-right
+                        [minX, minY, minZ], // Bottom-left
+                        [minX, maxY, minZ]  // Top-left
+                    ],
+                    uv: element.faces?.north?.uv,
+                    texture: element.faces?.north?.texture,
+                    normal: [0, 0, -1]
+                }
+            ];
+
+            for (const face of faces) {
+                // Skip faces without texture
+                if (!face.texture)
+                    continue;
+
+                const [u1, v1, u2, v2] = face.uv || [0, 0, 16, 16];
+                const faceVertexStart = vertices.length / 3;
+
+                // Add vertices for this face
+                for (const vert of face.vertices) {
+                    vertices.push(...vert);
+                    normals.push(...face.normal);
+                }
+
+                // Add UVs for this face (Minecraft to three.js conversion)
+                // Minecraft: (0,0) top-left, (16,16) bottom-right
+                // Three.js: (0,0) bottom-left, (1,1) top-right
+                uvs.push(
+                    u1 / 16, 1 - v2 / 16,  // UV for vertex 0 (bottom-left vertex)
+                    u1 / 16, 1 - v1 / 16,  // UV for vertex 1 (top-left vertex)
+                    u2 / 16, 1 - v2 / 16,  // UV for vertex 2 (bottom-right vertex)
+                    u2 / 16, 1 - v1 / 16   // UV for vertex 3 (top-right vertex)
+                );
+
+                // Add indices for two triangles with correct winding for outward-facing normals
+                // For all faces, we want them to face outward from the cube center
+                indices.push(
+                    faceVertexStart, faceVertexStart + 2, faceVertexStart + 1,
+                    faceVertexStart + 1, faceVertexStart + 2, faceVertexStart + 3
+                );
+
+                // Create material for this face
+                let material;
+
+                // material = new THREE.MeshLambertMaterial({ 
+                //     map: this.textures.get(face.texture),
+                //     transparent: true,
+                //     alphaTest: 0.1
+                // });
+                // no shade:
+                // material =  new THREE.MeshBasicMaterial({
+                //     map: this.textures.get(face.texture),
+                //     color: 0xffffff,
+                //     transparent: true,
+                //     alphaTest: 0.1,
+                //     aoMapIntensity: 0,
+                // });
+                material = new THREE.MeshStandardMaterial({
+                    map: this.textures.get(face.texture),
+                    color: 0xffffff,
+                    transparent: true,
+                    roughness: 1,
+                    metalness: 0,
+                    emissive: 1,
+                    alphaTest: 0.1,
+                    aoMapIntensity: 1,
+                });
+                
+                materials.push(material);
+                
+                // Add group for this face
+                groups.push({
+                    start: indices.length - 6, // 6 indices for 2 triangles
+                    count: 6,
+                    materialIndex: materialIndex
+                });
+                
+                materialIndex++;
+            }
+        }
+
+        geometry.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
+        geometry.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+        geometry.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
+        geometry.setIndex(indices);
+        // geometry.computeVertexNormals(); // Required for lighting // we get normals ourselves now
+        
+        // Apply groups to geometry
+        for (const group of groups) {
+            geometry.addGroup(group.start, group.count, group.materialIndex);
+        }
+
+        return { geometry, materials };
+    }
+
+    async loadTexture(texturePath: string) {
+        if (this.textures.has(texturePath)) {
+            return this.textures.get(texturePath);
+        }
+        
+        // Parse namespace and path
+        let namespace = 'minecraft';
+        let path = texturePath;
+        
+        if (texturePath.includes(':')) {
+            [namespace, path] = texturePath.split(':');
+        }
+        
+        // Construct texture URL
+        const textureUrl = `${this.baseUrl}assets/${namespace}/textures/${path}.png`;
+        
+        try {
+            const texture = await this.textureLoader.loadAsync(textureUrl);
+            texture.magFilter = THREE.NearestFilter;
+            texture.minFilter = THREE.NearestFilter;
+            this.textures.set(texturePath, texture);
+            return texture;
+        } catch (error) {
+            console.error('Failed to load texture:', textureUrl, error);
+            // Create a fallback texture
+            const canvas = document.createElement('canvas');
+            canvas.width = 16;
+            canvas.height = 16;
+            
+            const ctx = canvas.getContext('2d')!;
+            ctx.fillStyle = '#ff00ff';
+            ctx.fillRect(0, 0, 8, 8);
+            ctx.fillRect(8, 8, 8, 8);
+
+            ctx.fillStyle = '#000000';
+            ctx.fillRect(8, 0, 8, 8);
+            ctx.fillRect(0, 8, 8, 8);
+
+            const fallbackTexture = new THREE.CanvasTexture(canvas);
+            fallbackTexture.magFilter = THREE.NearestFilter;
+            fallbackTexture.minFilter = THREE.NearestFilter;
+            this.textures.set(texturePath, fallbackTexture);
+            return fallbackTexture;
+        }
+    }
+}
+
+// Initialize scene
+const scene = new THREE.Scene();
+//scene.background = new THREE.Color(0x87CEEB); // Sky blue background
+
+const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+camera.position.set(0, 1.5, -1.5);
+// overriden by controls
+// camera.lookAt(0, 0, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(window.devicePixelRatio);
+
+const container = document.getElementById('container')!;
+container.appendChild(renderer.domElement);
+
+// Lighting
+const ambientLight = new THREE.AmbientLight(undefined, 0.75);
+scene.add(ambientLight);
+
+const directionalLightIntensity = 2.85;
+
+const directionalLight = new THREE.DirectionalLight(0xffffff, directionalLightIntensity*0.98);
+directionalLight.position.set(0, 1, 0);
+scene.add(directionalLight);
+
+const directionalLight2 = new THREE.DirectionalLight(0xffffff, directionalLightIntensity*0.8);
+directionalLight2.position.set(1, 0, 0);
+scene.add(directionalLight2);
+
+const directionalLight3 = new THREE.DirectionalLight(0xffffff, directionalLightIntensity*0.608);
+directionalLight3.position.set(0, 0, -1);
+scene.add(directionalLight3);
+
+// Load and render model
+const textureLoader = new THREE.TextureLoader();
+// Base URL should be the root of your assets
+const modelLoader = new MinecraftModelLoader(textureLoader, '');
+
+async function loadAndAdd(modelPath: string, pos = [0, 0, 0], rot = [0, 0, 0]) {
+    const blockModel = await modelLoader.loadModel(modelPath);
+    const { geometry, materials } = await modelLoader.parseModel(blockModel!);
+
+    // Create mesh with multi-material using groups
+    const blockMesh = new THREE.Mesh(geometry, materials);
+    blockMesh.position.set(pos[0], pos[1], pos[2])
+    blockMesh.rotation.set(THREE.MathUtils.degToRad(rot[0]), THREE.MathUtils.degToRad(rot[1]), THREE.MathUtils.degToRad(rot[2]));
+    scene.add(blockMesh);
+}
+
+async function init() {
+    try {
+        await loadAndAdd('minecraft:block/grass_block', [0, -1, 0]);
+        await loadAndAdd('minecraft:block/iron_block');
+        await loadAndAdd('minecraft:block/iron_block', [0, 2, 0]);
+        await loadAndAdd('minecraft:block/iron_block', [-1, 1, 0]);
+        await loadAndAdd('minecraft:block/iron_block', [1, 1, 0]);
+        await loadAndAdd('stargate:block/toaster', [0, 1, 0], [0, 90, 0]);
+
+        await loadAndAdd('minecraft:block/cut_copper_stairs', [-1, 0, 0], [0, 0, 90]);
+        await loadAndAdd('minecraft:block/cut_copper_stairs', [-1, 2, 0], [0, 0, 0]);
+        await loadAndAdd('minecraft:block/cut_copper_stairs', [1, 0, 0], [0, 0, 180]);
+        await loadAndAdd('minecraft:block/cut_copper_stairs', [1, 2, 0], [0, 0, -90]);
+
+        // Add orbit controls for interaction
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.target.set(0, 1, 0)
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+
+        // Handle window resize
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        const targetFPS = 120; // Change this to your desired FPS
+        const frameInterval = 1000 / targetFPS; // Interval in milliseconds
+
+        let lastFrameTime = 0;
+
+        // Render loop with FPS limiting
+        function animate(currentTime: number) {
+            if (currentTime - lastFrameTime >= frameInterval) {
+                controls.update();
+                renderer.render(scene, camera);
+
+                lastFrameTime = currentTime;
+            }
+            
+            requestAnimationFrame(animate);
+        }
+
+        animate(0);
+    } catch (error) {
+        console.error('Error loading model:', error);
+        container.innerHTML = '<p>Error loading model. Check console for details.</p>';
+    }
+}
+
+init();
+</script>
