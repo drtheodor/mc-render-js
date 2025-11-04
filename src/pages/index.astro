@@ -52,6 +52,9 @@ class MinecraftModelLoader {
     textures: Map<string, string | THREE.Texture>;
     modelCache: Map<string, McModel>;
 
+    // TODO: material cache
+    // TODO: check for neighbour faces and dont render them
+
     constructor(textureLoader: THREE.TextureLoader, baseUrl = '') {
         this.textureLoader = textureLoader;
         this.baseUrl = baseUrl.replace(/\/$/, '') + '/';
@@ -77,6 +80,7 @@ class MinecraftModelLoader {
         const fullModelPath = `${this.baseUrl}assets/${namespace}/${path}.json`;
         
         if (this.modelCache.has(fullModelPath)) {
+            console.log('model cache hit for', fullModelPath, this.modelCache.get(fullModelPath))
             return this.modelCache.get(fullModelPath);
         }
         
@@ -85,6 +89,8 @@ class MinecraftModelLoader {
         if (!response.ok) {
             throw new Error(`Failed to load model: ${fullModelPath} - ${response.status}`);
         }
+
+        console.log('> fetching model', fullModelPath)
         
         const modelData = await response.json();
         const resolvedModel = await this.resolveModelInheritance(modelData, namespace);
@@ -115,9 +121,12 @@ class MinecraftModelLoader {
             if (!parentModel) {
                 throw Error("No parent model: " + fullParentPath);
             }
+
+            if (!model.elements && parentModel.elements) {
+                // Deep copy parent elements to avoid modifying the cached parent model
+                model.elements = JSON.parse(JSON.stringify(parentModel.elements));
+            }
             
-            // Inherit properties from parent
-            model.elements = model.elements || parentModel.elements;
             model.textures = { ...parentModel.textures, ...model.textures };
             model.ambientocclusion = model.ambientocclusion ?? parentModel.ambientocclusion;
             model.display = { ...parentModel.display, ...model.display };
@@ -310,14 +319,6 @@ class MinecraftModelLoader {
                     faceVertexStart + 1, faceVertexStart + 2, faceVertexStart + 3
                 );
 
-                // Create material for this face
-                let material;
-
-                // material = new THREE.MeshLambertMaterial({ 
-                //     map: this.textures.get(face.texture),
-                //     transparent: true,
-                //     alphaTest: 0.1
-                // });
                 // no shade:
                 // material =  new THREE.MeshBasicMaterial({
                 //     map: this.textures.get(face.texture),
@@ -326,7 +327,9 @@ class MinecraftModelLoader {
                 //     alphaTest: 0.1,
                 //     aoMapIntensity: 0,
                 // });
-                material = new THREE.MeshStandardMaterial({
+
+                // Create material for this face
+                const material = new THREE.MeshStandardMaterial({
                     map: this.textures.get(face.texture),
                     color: 0xffffff,
                     transparent: true,
@@ -462,9 +465,78 @@ async function loadAndAdd(modelPath: string, pos = [0, 0, 0], rot = [0, 0, 0]) {
     scene.add(blockMesh);
 }
 
+async function loadModonomicon(mapping: Record<string, string>, patterns: string[][], [ox, oy, oz] = [0, 0, 0]) {
+    const mappedBlocks: Record<string, { geometry: THREE.BufferGeometry, materials: THREE.Material[] }> = {}
+
+    for (const [k, modelPath] of Object.entries(mapping)) {
+        const [ namespace, path ] = modelPath.split(':');
+
+        const loaded = await modelLoader.loadModel(`${namespace}:block/${path}`)
+        const parsed = await modelLoader.parseModel(loaded!)
+
+        mappedBlocks[k] = parsed;
+    }
+
+    for (const [y, layer] of patterns.entries()) {
+        for (const [x, line] of layer.entries()) {
+            for (let z = 0; z < line.length; z++) {
+                const b = line[z];
+                const entry = mappedBlocks[b]
+
+                if (!entry) continue
+                
+                const blockMesh = new THREE.Mesh(entry.geometry, entry.materials);
+                blockMesh.position.set(x + ox, -y + oy, z + oz)
+                scene.add(blockMesh);
+            }
+        }
+    }
+}
+
 async function init() {
     try {
-        await loadAndAdd('minecraft:block/grass_block', [0, -1, 0]);
+        await loadModonomicon({
+         "B": "minecraft:note_block",
+         "G": "minecraft:gold_block",
+         "R": "minecraft:red_terracotta",
+         "W": "minecraft:white_wool"
+     },[
+    [ 
+        " GRG ", 
+        "GGRGG", 
+        "RRBRR", 
+        "GGRGG", 
+        " GRG " 
+    ],
+    [
+        "GG GG",
+        "G   G",
+        "     ",
+        "G   G",
+        "GG GG"
+    ],
+    [
+        "G   G",
+        "     ",
+        "     ",
+        "     ",
+        "G   G"
+    ], 
+    [
+        "G   G",
+        "     ",
+        "     ",
+        "     ",
+        "G   G"
+    ], 
+    [
+         "_WWW_",
+         "WWWWW",
+         "WWWWW",
+         "WWWWW",
+         "_WWW_"
+    ]
+], [3, 3, 3]);
         await loadAndAdd('minecraft:block/iron_block');
         await loadAndAdd('minecraft:block/iron_block', [0, 2, 0]);
         await loadAndAdd('minecraft:block/iron_block', [-1, 1, 0]);
