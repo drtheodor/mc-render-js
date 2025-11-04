@@ -80,7 +80,6 @@ class MinecraftModelLoader {
         const fullModelPath = `${this.baseUrl}assets/${namespace}/${path}.json`;
         
         if (this.modelCache.has(fullModelPath)) {
-            console.log('model cache hit for', fullModelPath, this.modelCache.get(fullModelPath))
             return this.modelCache.get(fullModelPath);
         }
         
@@ -89,8 +88,6 @@ class MinecraftModelLoader {
         if (!response.ok) {
             throw new Error(`Failed to load model: ${fullModelPath} - ${response.status}`);
         }
-
-        console.log('> fetching model', fullModelPath)
         
         const modelData = await response.json();
         const resolvedModel = await this.resolveModelInheritance(modelData, namespace);
@@ -124,7 +121,7 @@ class MinecraftModelLoader {
 
             if (!model.elements && parentModel.elements) {
                 // Deep copy parent elements to avoid modifying the cached parent model
-                model.elements = JSON.parse(JSON.stringify(parentModel.elements));
+                model.elements = structuredClone(parentModel.elements);
             }
             
             model.textures = { ...parentModel.textures, ...model.textures };
@@ -435,7 +432,7 @@ container.appendChild(renderer.domElement);
 const ambientLight = new THREE.AmbientLight(undefined, 0.75);
 scene.add(ambientLight);
 
-const directionalLightIntensity = 2.85;
+const directionalLightIntensity = 2.55; // 2.85
 
 const directionalLight = new THREE.DirectionalLight(0xffffff, directionalLightIntensity*0.98);
 directionalLight.position.set(0, 1, 0);
